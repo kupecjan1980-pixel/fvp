@@ -22,7 +22,13 @@ cp fvp.py fvp_ui.lua CHANGELOG.md README.md "$DEST/"
 if [ ! -x "$DEST/.venv/bin/python" ]; then
     python3 -m venv "$DEST/.venv"
 fi
-"$DEST/.venv/bin/pip" install -q --upgrade vapoursynth vapoursynth-mvtools numpy subliminal
+# (asked of PyPI only when the list changes: an update at the player's start must be quick)
+REQS="vapoursynth vapoursynth-mvtools numpy subliminal"
+if [ "$(cat "$DEST/.venv/fvp-reqs" 2>/dev/null)" != "$REQS" ]; then
+    # shellcheck disable=SC2086
+    "$DEST/.venv/bin/pip" install -q --upgrade $REQS
+    echo "$REQS" > "$DEST/.venv/fvp-reqs"
+fi
 # the shaders (text files): AMD FSR 1, FSRCNNX, ArtCNN
 fetch() { [ -s "$DEST/shaders/$1" ] || curl -sfL -m 60 -o "$DEST/shaders/$1" "$2" || echo "could not fetch $1 (upscaling step without it falls back to mpv's scaler)" >&2; }
 fetch FSR.glsl "https://gist.githubusercontent.com/agyild/82219c545228d70c5604f865ce0b0ce5/raw/FSR.glsl"

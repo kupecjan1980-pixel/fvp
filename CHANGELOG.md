@@ -5,6 +5,7 @@ more; a bigger novelty raises MINOR (PATCH from 0 again).
 
 ## 0.2 — Menu, seek bar, subtitles
 
+- **0.2.1** (2026-11-14) The right mouse button opens the menu (it did nothing: it was bound to mpv's command for a system-native menu, which Linux doesn't have; mpv's own menu script draws it now); what's on in the menu is marked with a dot. FVP updates itself at the start of playing: when GitHub has a newer release, it's downloaded, installed and started in place of the old one, in a few seconds (skipped without a network, with `--no-update`, or with `"auto_update": false` in ~/.config/fvp/config.json)
 - **0.2.0** (2026-11-14) A menu on the right mouse button with everything the player does: pause, seeking, frames in between and their preset, the upscaling step, the sound track, volume and mute, subtitles, full screen, status, quit. A bar along the bottom shows position / length (h:mm:ss) and the volume, and seeks on a click or a drag; it shows while the mouse moves and during a seek. Volume on the mouse wheel and the + and - keys. Subtitles: the film's own tracks, files beside the film, or looked up on the web (podnapisi.net, BSPlayer, OpenSubtitles and others, by the film's name and size, in Czech / the system's language and English). Sound tracks can be picked. Fixed: the sound was gone after seeking with the keys (a seek that came while the one before it was still opening read "no sound track" from mpv and kept it; the picked tracks are now kept by the player). One-line download and install: get.sh
 
 ## 0.1 — First prototype

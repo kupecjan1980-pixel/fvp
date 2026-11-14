@@ -33,7 +33,7 @@ import threading
 import time
 
 APP = "fvp"
-APP_VERSION = "0.2.0"  # 0.MINOR.PATCH: every change a version (PATCH + 1), a bigger novelty MINOR + 1
+APP_VERSION = "0.2.1"  # 0.MINOR.PATCH: every change a version (PATCH + 1), a bigger novelty MINOR + 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), APP)
 CONFIG = os.path.join(CONFIG_DIR, "config.json")
@@ -671,7 +671,9 @@ class Player:
     MPV_KEYS = {  # key -> what mpv does by itself
         "WHEEL_UP": "add volume 5", "WHEEL_DOWN": "add volume -5", "+": "add volume 5", "=": "add volume 5",
         "-": "add volume -5", "KP_ADD": "add volume 5", "KP_SUBTRACT": "add volume -5",
-        "MBTN_RIGHT": "context-menu", "MENU": "context-menu",
+        # the menu: mpv's own menu script draws it on Linux ("context-menu", the command, opens only the
+        # system's native menu, which exists on Windows: the right button did nothing with it)
+        "MBTN_RIGHT": "script-message-to context_menu open", "MENU": "script-message-to context_menu open",
     }
 
     def __init__(self, path: str, opts: dict):
@@ -710,6 +712,8 @@ class Player:
         if self.upscale not in UPSCALE:
             self.upscale = self.plan["upscale"]
         self._upscale_set()
+        if os.environ.get("FVP_UPDATED_FROM"):
+            self.mpv.osd(f"FVP updated: {os.environ['FVP_UPDATED_FROM']} → {APP_VERSION}", 5)
         self.start(float(opts.get("start") or 0))
         threading.Thread(target=self._watch_drawing, daemon=True).start()
 
@@ -976,8 +980,10 @@ class Player:
     def menu(self) -> None:
         """mpv's own context menu, filled with everything the player can do, as it is now."""
         def item(title, cmd, key="", on=None, off=False):
-            state = (["checked"] if on else []) + (["disabled"] if off else [])
-            return {"title": title, "cmd": cmd, "shortcut": key, "state": state}
+            # (what's on is marked with a dot in its name: the menu's own check mark is a sign the usual
+            # fonts don't have, drawn as an empty box)
+            return {"title": ("●  " if on else "") + title, "cmd": cmd, "shortcut": key,
+                    "state": ["disabled"] if off else []}
 
         def sv(what):
             return f"script-message sv {what}"
@@ -1015,7 +1021,7 @@ class Player:
             {"title": "Frames in between", "type": "submenu", "submenu": [
                 item("On" if not no_frames else "On (VapourSynth is missing: run install.sh)", sv("interp"), "i",
                      on=self.interp and bool(self.out), off=no_frames), sep]
-                + [item(f"{p}" + ("  (quickest)" if p == PRESET_ORDER[0] else "  (best, slowest)"
+                + [item(f"{p}" + ("  (quickest)" if p == PRESET_ORDER[0] else "  (slowest)"
                                   if p == PRESET_ORDER[-1] else ""), sv(f"preset-set {p}"),
                         on=p == self.preset, off=self.plan["interp"] != "mvtools") for p in PRESET_ORDER]},
             {"title": "Upscaling", "type": "submenu", "submenu": [
@@ -1079,8 +1085,57 @@ class Player:
         return 0
 
 
+# ---------------------------------------------------------------------------------------------------------
+# updating itself
+# ---------------------------------------------------------------------------------------------------------
+
+REPO = "kupecjan1980-pixel/fvp"
+INSTALLED = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), APP)
+
+
+def _ver(text: str) -> tuple:
+    return tuple(int(n) for n in re.findall(r"\d+", text)[:3])
+
+
+def auto_update(argv: list[str]) -> None:
+    """At the start of playing: when GitHub has a newer release, it's downloaded, installed (install.sh) and
+    started in this one's place. Only the installed copy does it (not one run from its source folder), not
+    with --no-update or "auto_update": false in the settings; no network or a slow one: skipped (2.5 s)."""
+    import tarfile
+    import tempfile
+    import urllib.request
+    if os.environ.get("FVP_UPDATED_FROM") or "--no-update" in argv or load_config().get("auto_update") is False \
+            or os.path.realpath(HERE) != os.path.realpath(INSTALLED):
+        return
+    agent = {"User-Agent": "fvp-updater"}
+    try:
+        req = urllib.request.Request(f"https://api.github.com/repos/{REPO}/releases/latest", headers=agent)
+        with urllib.request.urlopen(req, timeout=2.5) as r:
+            tag = json.load(r)["tag_name"]
+    except Exception:
+        return
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", tag) or _ver(tag) <= _ver(APP_VERSION):
+        return
+    print(f"FVP {APP_VERSION}: updating to {tag[1:]}…", flush=True)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            req = urllib.request.Request(f"https://github.com/{REPO}/archive/refs/tags/{tag}.tar.gz", headers=agent)
+            with urllib.request.urlopen(req, timeout=20) as r, tarfile.open(fileobj=r, mode="r|gz") as tar:
+                tar.extractall(tmp, filter="data")
+            script = os.path.join(tmp, f"fvp-{tag[1:]}", "install.sh")
+            done = subprocess.run(["bash", script], capture_output=True, text=True, timeout=600)
+        if done.returncode != 0:
+            print(f"FVP: the update did not install ({done.stderr.strip()[-200:]}); playing with {APP_VERSION}")
+            return
+    except Exception as e:
+        print(f"FVP: the update did not download ({e}); playing with {APP_VERSION}")
+        return
+    os.environ["FVP_UPDATED_FROM"] = APP_VERSION
+    os.execv(sys.executable, [sys.executable, os.path.join(INSTALLED, "fvp.py")] + argv)
+
+
 USAGE = f"""usage: {APP} FILM [--start SECONDS] [--preset {'|'.join(PRESET_ORDER)}] [--upscale {'|'.join(UPSCALE_ORDER)}]
-                    [--no-interp] [-- mpv options]
+                    [--no-interp] [--no-update] [-- mpv options]
        {APP} probe            what this computer has and what will be used for what
        {APP} bench FILM       how fast each preset runs here; the best one that keeps up is remembered
 
@@ -1132,6 +1187,8 @@ def main(argv: list[str]) -> int:
             continue
         if a == "--no-interp":
             opts["no_interp"] = True
+        elif a == "--no-update":
+            pass
         else:
             files.append(a)
         i += 1
@@ -1141,6 +1198,7 @@ def main(argv: list[str]) -> int:
     for tool in ("mpv", "ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             raise SystemExit(f"{APP}: {tool} is missing")
+    auto_update(argv)  # (a newer release: installed and started in this one's place)
     return Player(files[0], opts).run()
 
 

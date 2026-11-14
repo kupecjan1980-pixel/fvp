@@ -9,6 +9,8 @@ Install or update with one line (no root needed; needs python3, mpv, ffmpeg and 
 
     curl -fsSL https://raw.githubusercontent.com/kupecjan1980-pixel/fvp/master/get.sh | bash
 
+FVP then updates itself at the start of playing whenever there's a newer release (`--no-update` skips it).
+
 Or download the [newest release](https://github.com/kupecjan1980-pixel/fvp/releases/latest), unpack it and run
 `./install.sh`. Then:
 
