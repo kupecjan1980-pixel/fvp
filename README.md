@@ -3,14 +3,33 @@
 Plays films with frames made in between (24 → 60 a second) and upscaled, as they play. Linux; AMD, Intel and
 Nvidia processors and graphics cards, one or several of them.
 
-    git clone https://github.com/kupecjan1980-pixel/fvp && cd fvp
-    ./install.sh          # into ~/.local/share/fvp, no root needed
-    fvp FILM              # play
+## Download
+
+Install or update with one line (no root needed; needs python3, mpv, ffmpeg and curl):
+
+    curl -fsSL https://raw.githubusercontent.com/kupecjan1980-pixel/fvp/master/get.sh | bash
+
+Or download the [newest release](https://github.com/kupecjan1980-pixel/fvp/releases/latest), unpack it and run
+`./install.sh`. Then:
+
+    fvp FILM              # play (or "Open with › FVP" in the file manager)
     fvp probe             # what this computer has and what FVP will use it for
     fvp bench FILM        # how fast each preset runs here; the best one that keeps up is remembered
 
-Keys: arrows / PgUp / PgDn seek · `i` frames in between on/off · `p` / `P` better / quicker preset ·
-`u` next upscaling step · `o` or Tab status · space pause · `f` full screen · `q` quit.
+## Controls
+
+- **Right click**: the menu with everything: pause, seeking, frames in between and their preset, the upscaling
+  step, the sound track and volume, subtitles (the film's own, a file beside the film, or looked up on the
+  web), full screen, status, quit.
+- **The bar along the bottom** (shows when the mouse moves or on a seek): position / length as h:mm:ss, the
+  volume; click or drag it to seek.
+- **Keys**: arrows 5 s / 1 min, PgUp / PgDn 10 min, Home to the start · `+` / `-` or the mouse wheel volume,
+  `m` mute · `i` frames in between on/off · `p` / `P` better / quicker preset · `u` next upscaling step ·
+  `o` or Tab status · space pause · `f` full screen · `q` quit.
+
+Subtitles from the web are looked up by the film's file name and size at podnapisi.net, BSPlayer, OpenSubtitles
+and others (no account needed), in the system's language, Czech or Slovak where the clock says so, and English
+(`"sub_langs": ["cs", "en"]` in ~/.config/fvp/config.json changes that). They are kept in ~/.cache/fvp/subs.
 
 ## How it works
 
@@ -53,7 +72,7 @@ other card, so the two jobs don't get in each other's way.
 ## Not there yet
 
 - RIFE: untested (above); TensorRT on Nvidia and OpenVINO on Intel not started.
-- No seek bar or mouse seeking (mpv can't seek in a pipe; the keys do it).
+- No window for picking a film or a subtitle file yet: films open from the command line or "Open with".
 - HDR films: their colours are passed on to mpv, not checked on an HDR screen.
 - 4K films on weak processors: mvtools at 4K needs a strong processor; FVP turns the frames off when even
   `fastest` can't keep up.

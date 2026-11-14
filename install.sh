@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # FVP (Fluid Video Player): puts it in ~/.local/share/fvp with a Python of its own that has VapourSynth and
-# mvtools (from PyPI: the same on Arch, Bazzite, CachyOS, Fedora, Ubuntu; nothing needs root), fetches the
+# mvtools (and subliminal, for subtitles from the web; from PyPI: the same on Arch, Bazzite, CachyOS, Fedora, Ubuntu; nothing needs root), fetches the
 # upscaling shaders, and adds the `fvp` command and a launcher entry ("Open with" for films).
 # ./install.sh --remove takes it away again.
 set -euo pipefail
@@ -17,12 +17,12 @@ for tool in python3 mpv ffmpeg ffprobe curl; do
     command -v "$tool" >/dev/null || { echo "FVP needs $tool: install it first" >&2; exit 1; }
 done
 mkdir -p "$DEST/shaders" "$(dirname "$BIN")" "$(dirname "$DESKTOP")"
-cp fvp.py CHANGELOG.md README.md "$DEST/"
+cp fvp.py fvp_ui.lua CHANGELOG.md README.md "$DEST/"
 [ -d shaders ] && cp -n shaders/*.glsl "$DEST/shaders/" 2>/dev/null || true
 if [ ! -x "$DEST/.venv/bin/python" ]; then
     python3 -m venv "$DEST/.venv"
 fi
-"$DEST/.venv/bin/pip" install -q --upgrade vapoursynth vapoursynth-mvtools numpy
+"$DEST/.venv/bin/pip" install -q --upgrade vapoursynth vapoursynth-mvtools numpy subliminal
 # the shaders (text files): AMD FSR 1, FSRCNNX, ArtCNN
 fetch() { [ -s "$DEST/shaders/$1" ] || curl -sfL -m 60 -o "$DEST/shaders/$1" "$2" || echo "could not fetch $1 (upscaling step without it falls back to mpv's scaler)" >&2; }
 fetch FSR.glsl "https://gist.githubusercontent.com/agyild/82219c545228d70c5604f865ce0b0ce5/raw/FSR.glsl"

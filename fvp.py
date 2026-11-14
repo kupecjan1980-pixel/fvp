@@ -33,12 +33,15 @@ import threading
 import time
 
 APP = "fvp"
-APP_VERSION = "0.1.0"  # 0.MINOR.PATCH: every change a version (PATCH + 1), a bigger novelty MINOR + 1
+APP_VERSION = "0.2.0"  # 0.MINOR.PATCH: every change a version (PATCH + 1), a bigger novelty MINOR + 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), APP)
 CONFIG = os.path.join(CONFIG_DIR, "config.json")
 RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", APP)
 SHADERS = os.path.join(HERE, "shaders")
+UI_SCRIPT = os.path.join(HERE, "fvp_ui.lua")  # the seek bar, drawn inside mpv
+SUBS_CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), APP, "subs")
+SUB_EXTS = (".srt", ".ass", ".ssa", ".sub", ".vtt")
 
 # ---------------------------------------------------------------------------------------------------------
 # the worker: frames in between
@@ -171,6 +174,58 @@ def worker(args: list[str]) -> int:
         dst.flush()
     except BrokenPipeError:
         pass
+    return 0
+
+
+# ---------------------------------------------------------------------------------------------------------
+# subtitles from the web
+# ---------------------------------------------------------------------------------------------------------
+
+SUB_PROVIDERS = ["podnapisi", "bsplayer", "opensubtitles", "gestdown", "tvsubtitles"]  # (those needing no account)
+
+
+def sub_langs(cfg: dict) -> list[str]:
+    """The languages subtitles are looked for in, best first: the settings' "sub_langs", else the system's
+    language, Czech or Slovak where the clock is set to there (a Czech's system is often in English), English."""
+    if cfg.get("sub_langs"):
+        return list(cfg["sub_langs"])
+    out = []
+    lang = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "")[:2].lower()
+    if lang.isalpha() and lang != "c":
+        out.append(lang)
+    zone = os.path.realpath("/etc/localtime")
+    for place, code in (("Europe/Prague", "cs"), ("Europe/Bratislava", "sk")):
+        if zone.endswith(place) and code not in out:
+            out.insert(0, code)
+    if "en" not in out:
+        out.append("en")
+    return out
+
+
+def subs_dir(film: str) -> str:
+    return os.path.join(SUBS_CACHE, re.sub(r"[^\w.-]+", "_", os.path.splitext(os.path.basename(film))[0])[:120])
+
+
+def fetch_subs(args: list[str]) -> int:
+    """fvp.py subs FILM LANG[,LANG...]: looks the film up at the subtitle sites (by its name and size) and
+    saves the best subtitles of each language into the cache; prints 'saved LANG PATH' for each."""
+    film, langs = args[0], args[1].split(",")
+    from babelfish import Language
+    from subliminal import download_best_subtitles, region, save_subtitles, scan_video
+    region.configure("dogpile.cache.memory")
+    out = subs_dir(film)
+    os.makedirs(out, exist_ok=True)
+    video = scan_video(film)
+    want = set()
+    for code in langs:
+        try:
+            want.add(Language.fromietf(code))
+        except Exception:
+            pass
+    found = download_best_subtitles([video], want, providers=SUB_PROVIDERS).get(video, [])
+    for saved in save_subtitles(video, found, directory=out):
+        path = os.path.join(out, os.path.basename(saved.get_path(video)))
+        print(f"saved {saved.language} {path}", flush=True)
     return 0
 
 
@@ -535,7 +590,8 @@ class Mpv:
                 "--demuxer-max-bytes=600MiB", "--demuxer-readahead-secs=1.5", "--cache=yes", "--cache-pause=yes",
                 "--cache-pause-wait=0.3", "--rebase-start-time=no", "--cscale=bilinear", "--dscale=mitchell",
                 "--osd-font-size=30", "--keep-open=no", "--sub-auto=no", "--audio-file-auto=no",
-                "--title=FVP", "--input-default-bindings=yes", "--osc=no"] + extra
+                "--title=FVP", "--input-default-bindings=yes", "--osc=no", "--osd-bar=no", "--osd-on-seek=no",
+                "--volume-max=150"] + ([f"--script={UI_SCRIPT}"] if os.path.exists(UI_SCRIPT) else []) + extra
         self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL)
         self.sock = None
@@ -611,7 +667,11 @@ class Player:
         "RIGHT": "seek 5", "LEFT": "seek -5", "UP": "seek 60", "DOWN": "seek -60", "PGUP": "seek 600",
         "PGDWN": "seek -600", "Shift+RIGHT": "seek 1", "Shift+LEFT": "seek -1", "HOME": "seekto 0",
         "i": "interp", "u": "upscale", "p": "preset 1", "P": "preset -1", "o": "status", "TAB": "status",
-        "WHEEL_UP": "seek 5", "WHEEL_DOWN": "seek -5",
+    }
+    MPV_KEYS = {  # key -> what mpv does by itself
+        "WHEEL_UP": "add volume 5", "WHEEL_DOWN": "add volume -5", "+": "add volume 5", "=": "add volume 5",
+        "-": "add volume -5", "KP_ADD": "add volume 5", "KP_SUBTRACT": "add volume -5",
+        "MBTN_RIGHT": "context-menu", "MENU": "context-menu",
     }
 
     def __init__(self, path: str, opts: dict):
@@ -626,12 +686,20 @@ class Player:
         self.chain, self.base, self.pending = None, 0.0, None
         self.lock = threading.RLock()
         self.done = threading.Event()
-        self.underruns, self.tracks = [], {}
+        self.underruns = []
+        # the sound and subtitle tracks picked (mpv's ids; None: the first sound track): kept by the player and
+        # set again on every new stretch. (Read back from mpv at each seek before: a seek while the stretch
+        # before it was still opening read "no sound track" and kept it, so the sound was gone after seeking.)
+        self.tracks = {"aid": None, "sid": "no"}
+        self.extra_subs, self.ready = [], False  # subtitle files added (the web's, a file's); the stretch is open
         self.mpv = Mpv(opts.get("mpv", []))
         self.mpv.handlers.append(self._event)
         for key, what in self.KEYS.items():
             self.mpv.cmd("keybind", key, f"script-message sv {what}")
-        self.mpv.cmd("observe_property", 1, "paused-for-cache")
+        for key, what in self.MPV_KEYS.items():
+            self.mpv.cmd("keybind", key, what)
+        for n, prop in enumerate(("paused-for-cache", "aid", "sid", "pause", "mute", "fullscreen"), 1):
+            self.mpv.cmd("observe_property", n, prop)
         hz = self.mpv.get("display-fps") or 0
         for _ in range(20):  # (known once the window is up)
             if hz:
@@ -680,7 +748,7 @@ class Player:
                 self.chain.stop()
                 self.chain = None
             pos = max(0.0, min(pos, max(0.0, self.info["duration"] - 1)))
-            self.base = pos
+            self.base, self.ready = pos, False
             if self.interp and self.out:
                 self.chain = Chain(self.path, self.info, self.out, pos, self.plan, self.preset)
                 colour = colour_filter(self.info)
@@ -692,20 +760,31 @@ class Player:
                 self.mpv.set("hwdec", "auto-safe")
                 self.mpv.cmd("loadfile", self.path, "replace", -1, f"start={pos:.3f}")
 
+    def _tracks(self, kind: str) -> list:
+        return [t for t in (self.mpv.get("track-list") or []) if t.get("type") == kind]
+
     def _loaded(self) -> None:
-        """The stretch is open: the film's own sound and subtitles beside it (mpv seeks them to its time)."""
+        """The stretch is open: the film's own sound and subtitles beside it (mpv seeks them to its time), the
+        subtitle files added, and the tracks picked before."""
         with self.lock:
-            if not self.chain:
-                return
-            self.mpv.cmd("audio-add", self.path, "auto")
-            self.mpv.cmd("sub-add", self.path, "auto")
-            for prop in ("aid", "sid"):
-                want = self.tracks.get(prop)
-                if want is not None:
-                    self.mpv.set(prop, want)
-                elif prop == "aid":
-                    self.mpv.set("aid", 1)
+            if self.chain:
+                self.mpv.cmd("audio-add", self.path, "auto")
+                if not self._tracks("sub"):
+                    self.mpv.cmd("sub-add", self.path, "auto")
+            for path in self.extra_subs:
+                self.mpv.cmd("sub-add", path, "auto")
+            audio = self._tracks("audio")
+            aid = self.tracks["aid"]
+            if audio and aid not in [t["id"] for t in audio]:
+                aid = audio[0]["id"]
+            self.mpv.set("aid", aid if audio else "no")
+            sid = self.tracks["sid"]
+            self.mpv.set("sid", sid if sid in [t["id"] for t in self._tracks("sub")] else "no")
             self.mpv.set("force-media-title", os.path.basename(self.path))
+            self.mpv.cmd("script-message", "fvp-ui", "duration", f"{self.info['duration']:.2f}")
+            self.mpv.cmd("script-message", "fvp-ui", "arrived")
+            self.ready = True
+        self.menu()
 
     def pos(self) -> float:
         t = self.mpv.get("time-pos")
@@ -727,6 +806,14 @@ class Player:
                     self.mpv.cmd("quit")
         elif ev == "property-change" and msg.get("name") == "paused-for-cache" and msg.get("data") is True:
             self._underrun()
+        elif ev == "property-change" and msg.get("name") in ("aid", "sid") and self.ready:
+            # (picked with mpv's own keys: remembered like the menu's picks)
+            v = msg.get("data")
+            self.tracks[msg["name"]] = v if isinstance(v, int) and not isinstance(v, bool) else \
+                ("no" if msg["name"] == "sid" else self.tracks["aid"])
+            threading.Thread(target=self.menu, daemon=True).start()
+        elif ev == "property-change" and msg.get("name") in ("pause", "mute", "fullscreen"):
+            threading.Thread(target=self.menu, daemon=True).start()
         elif ev == "client-message" and (msg.get("args") or [None])[0] == "sv":
             threading.Thread(target=self._key, args=(msg["args"][1:],), daemon=True).start()
 
@@ -756,7 +843,7 @@ class Player:
         """Seeks pile up while a key is held: the last one wins, a moment after it."""
         with self.lock:
             self.pending = pos
-            self.mpv.osd(f"{clock(pos)} / {clock(self.info['duration'])}", 1.5)
+            self.mpv.cmd("script-message", "fvp-ui", "seeking", f"{pos:.2f}")  # (the bar shows where it goes)
             mine = self._seek_id = getattr(self, "_seek_id", 0) + 1
 
         def go():
@@ -764,10 +851,6 @@ class Player:
             with self.lock:
                 if self._seek_id != mine:
                     return
-                for prop in ("aid", "sid"):
-                    v = self.mpv.get(prop)
-                    if v is not None and self.chain:
-                        self.tracks[prop] = v
                 self._started = time.monotonic()
                 self.start(pos)
                 self.pending = None
@@ -794,10 +877,11 @@ class Player:
                 return
             self.mpv.osd("Frames in between: " + (self._interp_text() if self.interp else "off"), 3)
             self._restart()
-        elif what == "preset":
+            self.menu()
+        elif what in ("preset", "preset-set"):
             if self.plan["interp"] != "mvtools":
                 return
-            i = PRESET_ORDER.index(self.preset) + int(args[1])
+            i = PRESET_ORDER.index(self.preset) + int(args[1]) if what == "preset" else PRESET_ORDER.index(args[1])
             if 0 <= i < len(PRESET_ORDER):
                 self.preset = PRESET_ORDER[i]
                 self.cfg.setdefault("presets", {})[size_class(self.info)] = self.preset
@@ -805,8 +889,10 @@ class Player:
                 self.mpv.osd(f"Frames in between: '{self.preset}'", 3)
                 if self.interp:
                     self._restart()
-        elif what == "upscale":
-            i = (UPSCALE_ORDER.index(self.upscale) + 1) % len(UPSCALE_ORDER)
+                self.menu()
+        elif what in ("upscale", "upscale-set"):
+            i = (UPSCALE_ORDER.index(self.upscale) + 1) % len(UPSCALE_ORDER) if what == "upscale" else \
+                UPSCALE_ORDER.index(args[1])
             self.upscale = UPSCALE_ORDER[i]
             files = shader_list(self.upscale)
             self._upscale_set()
@@ -814,8 +900,147 @@ class Player:
             save_config(self.cfg)
             missing = UPSCALE[self.upscale][2] and not files
             self.mpv.osd(f"Upscaling: {self.upscale}" + (" (its shader isn't installed: run install.sh)" if missing else ""), 3)
+            self.menu()
         elif what == "status":
             self.mpv.osd(self.status(), 6)
+            self.mpv.cmd("script-message", "fvp-ui", "show", "6")
+        elif what in ("aid", "sid"):
+            v = int(args[1]) if args[1].isdigit() else "no"
+            self.tracks[what] = v
+            if self.ready:
+                self.mpv.set(what, v)
+            self.menu()
+        elif what == "subfile":
+            files = self.sub_files()
+            if args[1].isdigit() and int(args[1]) < len(files):
+                self._add_sub(files[int(args[1])])
+        elif what == "websubs":
+            self._web_subs()
+
+    # --- subtitles ---------------------------------------------------------------------------------------
+    def sub_files(self) -> list[str]:
+        """Subtitle files to offer: those beside the film and those fetched from the web for it."""
+        out = []
+        for d in (os.path.dirname(self.path), subs_dir(self.path)):
+            try:
+                names = sorted(os.listdir(d))
+            except OSError:
+                continue
+            out += [os.path.join(d, n) for n in names if n.lower().endswith(SUB_EXTS)]
+        return out
+
+    def _add_sub(self, path: str) -> None:
+        with self.lock:
+            if path not in self.extra_subs:
+                self.extra_subs.append(path)
+                if self.ready:
+                    self.mpv.cmd("sub-add", path, "auto")
+            sid = next((t["id"] for t in self._tracks("sub") if t.get("external-filename") == path), None)
+            if sid is not None:
+                self.tracks["sid"] = sid
+                self.mpv.set("sid", sid)
+        self.mpv.osd(f"Subtitles: {os.path.basename(path)}", 3)
+        self.menu()
+
+    def _web_subs(self) -> None:
+        if getattr(self, "_searching", False):
+            return
+        py = self.plan["python"]
+        if not py or subprocess.run([py, "-c", "import subliminal"], capture_output=True).returncode != 0:
+            self.mpv.osd("Subtitles from the web: not installed (run install.sh)", 4)
+            return
+        langs = sub_langs(self.cfg)
+        self._searching = True
+        self.mpv.osd(f"Looking for subtitles on the web ({', '.join(langs)})…", 60)
+        try:
+            r = subprocess.run([py, os.path.abspath(__file__), "subs", self.path, ",".join(langs)],
+                               capture_output=True, text=True, timeout=90)
+            saved = [line.split(" ", 2) for line in r.stdout.splitlines() if line.startswith("saved ")]
+        except (OSError, subprocess.TimeoutExpired):
+            saved = []
+        finally:
+            self._searching = False
+        if not saved:
+            self.mpv.osd(f"No subtitles found on the web ({', '.join(langs)})", 5)
+            return
+        by_lang = {lang: path for _s, lang, path in reversed(saved)}
+        best = next((by_lang[k] for want in langs for k in by_lang if k.split("-")[0] == want), saved[0][2])
+        for _s, _lang, path in saved:
+            if path != best and path not in self.extra_subs:
+                self.extra_subs.append(path)
+                if self.ready:
+                    self.mpv.cmd("sub-add", path, "auto")
+        self._add_sub(best)
+
+    # --- the menu (right click) --------------------------------------------------------------------------
+    def menu(self) -> None:
+        """mpv's own context menu, filled with everything the player can do, as it is now."""
+        def item(title, cmd, key="", on=None, off=False):
+            state = (["checked"] if on else []) + (["disabled"] if off else [])
+            return {"title": title, "cmd": cmd, "shortcut": key, "state": state}
+
+        def sv(what):
+            return f"script-message sv {what}"
+        sep = {"type": "separator"}
+
+        def label(t):
+            own = not t.get("external") or t.get("external-filename") == self.path  # (the film's own track)
+            title = t.get("title") or ""
+            if title in (os.path.basename(self.path), os.path.basename(t.get("external-filename") or "")):
+                title = ""  # (mpv's stand-in for a track with no title: the file's name)
+            bits = [t.get("lang") or ("" if not own else "unknown language"), title]
+            if not own and "/" + APP + "/subs/" in (t.get("external-filename") or ""):
+                bits.insert(0, "from the web:")
+            if t["type"] == "audio":
+                bits.append(" ".join(str(x) for x in (t.get("codec"), f"{t.get('demux-channel-count')} ch"
+                                                      if t.get("demux-channel-count") else "") if x))
+            elif t.get("external") and t.get("external-filename") != self.path:
+                bits.append(os.path.basename(t.get("external-filename") or "file"))
+            if t.get("forced"):
+                bits.append("forced")
+            return "  ".join(b for b in bits if b) or f"track {t['id']}"
+        audio, subs = self._tracks("audio"), self._tracks("sub")
+        aid, sid = self.mpv.get("aid"), self.mpv.get("sid")
+        no_frames = self.plan["interp"] == "off"
+        files = self.sub_files()
+        known = {t.get("external-filename") for t in subs}
+        data = [
+            item("Pause / play", "cycle pause", "Space", on=bool(self.mpv.get("pause"))),
+            {"title": "Seek", "type": "submenu", "submenu": [
+                item("5 s forward", sv("seek 5"), "→"), item("5 s back", sv("seek -5"), "←"),
+                item("1 min forward", sv("seek 60"), "↑"), item("1 min back", sv("seek -60"), "↓"),
+                item("10 min forward", sv("seek 600"), "PgUp"), item("10 min back", sv("seek -600"), "PgDn"),
+                item("To the start", sv("seekto 0"), "Home")]},
+            sep,
+            {"title": "Frames in between", "type": "submenu", "submenu": [
+                item("On" if not no_frames else "On (VapourSynth is missing: run install.sh)", sv("interp"), "i",
+                     on=self.interp and bool(self.out), off=no_frames), sep]
+                + [item(f"{p}" + ("  (quickest)" if p == PRESET_ORDER[0] else "  (best, slowest)"
+                                  if p == PRESET_ORDER[-1] else ""), sv(f"preset-set {p}"),
+                        on=p == self.preset, off=self.plan["interp"] != "mvtools") for p in PRESET_ORDER]},
+            {"title": "Upscaling", "type": "submenu", "submenu": [
+                item({"plain": "plain  (ordinary scaler)", "sharp": "sharp  (lanczos)", "fsr": "fsr  (AMD FSR 1)",
+                      "light": "light  (neural net FSRCNNX)", "good": "good  (neural net ArtCNN C4F16)",
+                      "best": "best  (neural net ArtCNN C4F32)"}[u], sv(f"upscale-set {u}"), on=u == self.upscale)
+                for u in UPSCALE_ORDER]},
+            sep,
+            {"title": "Sound", "type": "submenu", "submenu": [
+                item(label(t), sv(f"aid {t['id']}"), on=t["id"] == aid) for t in audio]
+                + [sep, item("Louder", "add volume 5", "+ / wheel"), item("Quieter", "add volume -5", "- / wheel"),
+                   item("Mute", "cycle mute", "m", on=bool(self.mpv.get("mute")))]},
+            {"title": "Subtitles", "type": "submenu", "submenu": [
+                item("Off", sv("sid no"), on=sid in (False, None, "no"))]
+                + [item(label(t), sv(f"sid {t['id']}"), on=t["id"] == sid) for t in subs]
+                + [sep, item(f"Look on the web ({', '.join(sub_langs(self.cfg))})", sv("websubs"))]
+                + [item("File: " + os.path.basename(p), sv(f"subfile {i}")) for i, p in enumerate(files)
+                   if p not in known]},
+            sep,
+            item("Full screen", "cycle fullscreen", "f", on=bool(self.mpv.get("fullscreen"))),
+            item("Status", sv("status"), "o"),
+            sep,
+            item("Quit FVP", "quit", "q"),
+        ]
+        self.mpv.set("menu-data", data)
 
     def _interp_text(self) -> str:
         return (f"{self.plan['interp']} '{self.preset}' on {self.plan['interp_on']}, "
@@ -859,13 +1084,17 @@ USAGE = f"""usage: {APP} FILM [--start SECONDS] [--preset {'|'.join(PRESET_ORDER
        {APP} probe            what this computer has and what will be used for what
        {APP} bench FILM       how fast each preset runs here; the best one that keeps up is remembered
 
-keys: arrows / PgUp / PgDn seek, i frames in between on/off, p / P better / quicker preset,
-      u upscaling step, o or Tab status, space pause, f full screen, q quit"""
+keys: arrows / PgUp / PgDn seek, + / - or the mouse wheel volume, i frames in between on/off,
+      p / P better / quicker preset, u upscaling step, o or Tab status, space pause, f full screen, q quit
+mouse: right click the menu (sound and subtitle tracks, subtitles from the web, everything else);
+       move it for the bar along the bottom (position / length), click or drag the bar to seek"""
 
 
 def main(argv: list[str]) -> int:
     if len(argv) >= 1 and argv[0] == "worker":
         return worker(argv[1:])
+    if len(argv) >= 3 and argv[0] == "subs":
+        return fetch_subs(argv[1:])
     if not argv or argv[0] in ("-h", "--help"):
         print(USAGE)
         return 0
