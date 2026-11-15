@@ -16,7 +16,7 @@ Or download the [newest release](https://github.com/kupecjan1980-pixel/fvp/relea
 
     fvp FILM              # play (or "Open with › FVP" in the file manager)
     fvp probe             # what this computer has and what FVP will use it for
-    fvp bench FILM        # how fast each preset runs here; the best one that keeps up is remembered
+    fvp bench FILM        # measures this computer for its screen (size, rate) and sets the best that keeps up
 
 ## Controls
 
@@ -27,7 +27,7 @@ Or download the [newest release](https://github.com/kupecjan1980-pixel/fvp/relea
   volume; click or drag it to seek.
 - **Keys**: arrows 5 s / 1 min, PgUp / PgDn 10 min, Home to the start · `+` / `-` or the mouse wheel volume,
   `m` mute · `i` frames in between on/off · `p` / `P` better / quicker preset · `u` next upscaling step ·
-  `o` or Tab status · space pause · `f` full screen · `q` quit.
+  `o` or Tab statistics · `b` benchmark · space pause · `f` full screen · `q` quit.
 
 Subtitles from the web are looked up by the film's file name and size at podnapisi.net, BSPlayer, OpenSubtitles
 and others (no account needed), in the system's language, Czech or Slovak where the clock says so, and English

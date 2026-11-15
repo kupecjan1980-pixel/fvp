@@ -33,7 +33,7 @@ import threading
 import time
 
 APP = "fvp"
-APP_VERSION = "0.2.1"  # 0.MINOR.PATCH: every change a version (PATCH + 1), a bigger novelty MINOR + 1
+APP_VERSION = "0.3.0"  # 0.MINOR.PATCH: every change a version (PATCH + 1), a bigger novelty MINOR + 1
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), APP)
 CONFIG = os.path.join(CONFIG_DIR, "config.json")
@@ -286,6 +286,12 @@ def _pci_name(dev: str) -> str:
 
 def probe() -> dict:
     cpu = {"name": "", "threads": os.cpu_count() or 1, "flags": set()}
+    cores = set()
+    for block in _read("/proc/cpuinfo").split("\n\n"):
+        ids = dict(re.findall(r"^(physical id|core id)\s*:\s*(\d+)", block, re.M))
+        if ids:
+            cores.add((ids.get("physical id"), ids.get("core id")))
+    cpu["cores"] = len(cores) or cpu["threads"]
     for line in _read("/proc/cpuinfo").splitlines():
         if line.startswith("model name") and not cpu["name"]:
             cpu["name"] = line.split(":", 1)[1].strip()
@@ -311,8 +317,72 @@ def probe() -> dict:
             if os.path.isdir(f"{dev}/drm") else ""
         tier = next(t for rx, t in GPU_TIERS if re.search(rx, name, re.I))
         gpus.append({"card": card, "vendor": VENDORS[vid], "name": name, "driver": driver, "render": render,
+                     "sys": dev,
                      "screen": bool(screens), "tier": tier, "index": len(gpus)})
     return {"cpu": cpu, "gpus": gpus, "plan": plan(cpu, gpus)}
+
+
+class Meters:
+    """How busy the processor and the graphics cards are, between one reading and the next."""
+
+    def __init__(self, gpus: list):
+        self.gpus, self.last, self.procs = gpus, {}, {}
+        self.tick = os.sysconf("SC_CLK_TCK") or 100
+        self.nvidia, self.nvidia_at = {}, 0.0
+        self.cpu()
+
+    def cpu(self) -> tuple[float, list[float]]:
+        """(all threads together %, [each thread %])"""
+        now, out = {}, []
+        for line in _read("/proc/stat").splitlines():
+            if line.startswith("cpu"):
+                p = line.split()
+                v = [int(x) for x in p[1:9]]
+                now[p[0]] = (v[3] + v[4], sum(v))
+        for name in sorted((n for n in now if n != "cpu"), key=lambda n: int(n[3:])):
+            out.append(self._busy(name, now))
+        total = self._busy("cpu", now)
+        self.last = now
+        return total, out
+
+    def _busy(self, name: str, now: dict) -> float:
+        idle0, all0 = self.last.get(name, (0, 0))
+        idle1, all1 = now[name]
+        return 100.0 * (1 - (idle1 - idle0) / max(1, all1 - all0)) if name in self.last else 0.0
+
+    def proc(self, pid: int) -> float:
+        """A program's share since the last reading, in % of one thread (100 = one thread fully)."""
+        text = _read(f"/proc/{pid}/stat")
+        if not text:
+            return 0.0
+        f = text.rsplit(")", 1)[1].split()
+        used, t = (int(f[11]) + int(f[12])) / self.tick, time.monotonic()
+        used0, t0 = self.procs.get(pid, (used, t))
+        self.procs[pid] = (used, t)
+        return 100.0 * (used - used0) / (t - t0) if t > t0 else 0.0
+
+    def gpu(self, g: dict) -> str:
+        """A card's load in words: '37 %, memory 1.2 of 2.0 GB' ('' when the driver tells nothing)."""
+        dev = g.get("sys", "")
+        if g["vendor"] == "Nvidia":
+            if time.monotonic() - self.nvidia_at > 1.5:
+                self.nvidia_at = time.monotonic()
+                try:
+                    r = subprocess.run(["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+                                        "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3)
+                    self.nvidia = {p[0].strip(): p[1:] for p in (line.split(",") for line in r.stdout.splitlines())
+                                   if len(p) == 4}
+                except (OSError, subprocess.TimeoutExpired):
+                    self.nvidia = {}
+            hit = next((v for k, v in self.nvidia.items() if k in g["name"] or g["name"] in k),
+                       next(iter(self.nvidia.values()), None) if len(self.nvidia) == 1 else None)
+            return f"{hit[0].strip()} %, memory {int(hit[1]) / 1024:.1f} of {int(hit[2]) / 1024:.1f} GB" if hit else ""
+        busy = _read(f"{dev}/gpu_busy_percent")
+        used, total = _read(f"{dev}/mem_info_vram_used"), _read(f"{dev}/mem_info_vram_total")
+        parts = [f"{busy} %"] if busy.isdigit() else []
+        if used.isdigit() and total.isdigit() and int(total):
+            parts.append(f"memory {int(used) / 2 ** 30:.1f} of {int(total) / 2 ** 30:.1f} GB")
+        return ", ".join(parts)
 
 
 def worker_python() -> str | None:
@@ -488,11 +558,13 @@ class Chain:
             pass
 
 
-def bench(path: str, seconds: float = 6.0, start: float = None, verbose: bool = True) -> dict:
-    """How fast each preset makes frames from this film on this computer: {preset: times real time}."""
-    info, pr = film_info(path), probe()
-    pl = pr["plan"]
-    out = out_rate(info, 60) or (60, 1)
+def bench(path: str, seconds: float = 6.0, start: float = None, verbose: bool = True, info: dict = None,
+          pl: dict = None, out: tuple = None, progress=None) -> dict:
+    """How fast each preset makes frames from this film on this computer: {preset: times real time} (real
+    time: the rate `out`, the screen's). The presets after the first too slow one aren't run."""
+    info = info or film_info(path)
+    pl = pl or probe()["plan"]
+    out = out or out_rate(info, 60) or (60, 1)
     if pl["interp"] == "off":
         raise SystemExit(f"{APP}: VapourSynth is missing: run install.sh")
     start = info["duration"] * 0.4 if start is None else start
@@ -500,6 +572,8 @@ def bench(path: str, seconds: float = 6.0, start: float = None, verbose: bool = 
     results = {}
     presets = PRESET_ORDER if pl["interp"] == "mvtools" else ["0"]
     for preset in presets:
+        if progress:
+            progress(preset)
         got = []
         chain = Chain(path, info, out, start, pl, preset, got.append)
         sink = subprocess.Popen(["ffmpeg", "-v", "error", "-nostdin", "-i", chain.fifo, "-f", "null", "-"],
@@ -587,8 +661,10 @@ class Mpv:
         self.sock_path = os.path.join(RUNTIME, f"{os.getpid()}.sock")
         args = ["mpv", "--idle=yes", "--force-window=yes", f"--input-ipc-server={self.sock_path}",
                 "--no-config", "--vo=gpu-next", "--hwdec=no", "--video-sync=display-resample",
-                "--demuxer-max-bytes=600MiB", "--demuxer-readahead-secs=1.5", "--cache=yes", "--cache-pause=yes",
-                "--cache-pause-wait=0.3", "--rebase-start-time=no", "--cscale=bilinear", "--dscale=mitchell",
+                "--demuxer-max-bytes=1024MiB", "--demuxer-readahead-secs=2.5", "--cache=yes", "--cache-pause=yes",
+                # a stretch starts (the film's start, after every seek) only once a second of it is ready:
+                # the first frames come slower than they play, and it stuttered until they caught up
+                "--cache-pause-initial=yes", "--cache-pause-wait=1.0", "--rebase-start-time=no", "--cscale=bilinear", "--dscale=mitchell",
                 "--osd-font-size=30", "--keep-open=no", "--sub-auto=no", "--audio-file-auto=no",
                 "--title=FVP", "--input-default-bindings=yes", "--osc=no", "--osd-bar=no", "--osd-on-seek=no",
                 "--volume-max=150"] + ([f"--script={UI_SCRIPT}"] if os.path.exists(UI_SCRIPT) else []) + extra
@@ -647,6 +723,26 @@ class Mpv:
         ev.wait(wait)
         return box[0].get("data") if box and box[0].get("error") == "success" else None
 
+    def named(self, **command) -> None:
+        """A command with named arguments (osd-overlay has no other form)."""
+        try:
+            with self.lock:
+                self.sock.sendall(json.dumps({"command": command}).encode() + b"\n")
+        except OSError:
+            pass
+
+    def overlay(self, oid: int, lines: list[str] | None, size: int = 15, top: bool = True) -> None:
+        """Text kept on the picture until taken off (None): in a fixed-width font, top left or the middle."""
+        if lines is None:
+            self.named(name="osd-overlay", id=oid, format="none", data="")
+            return
+        esc = [ln.replace("\\", "/").replace("{", "(").replace("}", ")") for ln in lines]
+        # (spaces at a line's start are dropped by the renderer: hard ones in their place)
+        esc = ["\\h" * (len(ln) - len(ln.lstrip(" "))) + ln.lstrip(" ") for ln in esc]
+        head = f"{{\\an{7 if top else 5}\\fnmonospace\\fs{size}\\bord1.2\\shad0\\1c&HFFFFFF&\\3c&H000000&\\4a&H80&}}"
+        self.named(name="osd-overlay", id=oid, format="ass-events", res_x=0, res_y=720,
+                   data=head + "\\N".join(esc))
+
     def get(self, prop: str):
         return self.cmd("get_property", prop)
 
@@ -666,7 +762,8 @@ class Player:
     KEYS = {  # key -> what the player is told
         "RIGHT": "seek 5", "LEFT": "seek -5", "UP": "seek 60", "DOWN": "seek -60", "PGUP": "seek 600",
         "PGDWN": "seek -600", "Shift+RIGHT": "seek 1", "Shift+LEFT": "seek -1", "HOME": "seekto 0",
-        "i": "interp", "u": "upscale", "p": "preset 1", "P": "preset -1", "o": "status", "TAB": "status",
+        "i": "interp", "u": "upscale", "p": "preset 1", "P": "preset -1", "o": "stats", "TAB": "stats",
+        "b": "assess",
     }
     MPV_KEYS = {  # key -> what mpv does by itself
         "WHEEL_UP": "add volume 5", "WHEEL_DOWN": "add volume -5", "+": "add volume 5", "=": "add volume 5",
@@ -694,6 +791,9 @@ class Player:
         # before it was still opening read "no sound track" and kept it, so the sound was gone after seeking.)
         self.tracks = {"aid": None, "sid": "no"}
         self.extra_subs, self.ready = [], False  # subtitle files added (the web's, a file's); the stretch is open
+        self.settled = False  # the stretch has begun to play (its start's buffering is over)
+        self.stats_on, self.assessing = False, False
+        self.meters = Meters(self.probe["gpus"])
         self.mpv = Mpv(opts.get("mpv", []))
         self.mpv.handlers.append(self._event)
         for key, what in self.KEYS.items():
@@ -716,6 +816,11 @@ class Player:
             self.mpv.osd(f"FVP updated: {os.environ['FVP_UPDATED_FROM']} → {APP_VERSION}", 5)
         self.start(float(opts.get("start") or 0))
         threading.Thread(target=self._watch_drawing, daemon=True).start()
+        threading.Thread(target=self._stats_loop, daemon=True).start()
+        # the first film of a size on this computer (or `fvp bench`): what it can do is measured first
+        if opts.get("bench") or (self.interp and self.out and size_class(self.info) not in self.cfg.get("presets", {})
+                                 and not opts.get("preset")):
+            threading.Thread(target=self.assess, args=(bool(opts.get("bench")),), daemon=True).start()
 
     def _upscale_set(self) -> None:
         scale, deband, _files = UPSCALE[self.upscale]
@@ -733,7 +838,7 @@ class Player:
         """The upscaling steps down by itself while a frame's drawing takes more than 60 % of its time on the
         screen (the rest is for the desktop and whatever else draws): frames would come late."""
         while not self.done.wait(4.0):
-            if self.mpv.get("pause") or time.monotonic() - getattr(self, "_drawn_since", 0) < 6:
+            if self.assessing or self.mpv.get("pause") or time.monotonic() - getattr(self, "_drawn_since", 0) < 6:
                 continue
             fps = (self.out[0] / self.out[1]) if (self.chain and self.out) else self.info["fn"] / self.info["fd"]
             ms, room = self.draw_ms(), 600.0 / max(1.0, fps)
@@ -752,7 +857,7 @@ class Player:
                 self.chain.stop()
                 self.chain = None
             pos = max(0.0, min(pos, max(0.0, self.info["duration"] - 1)))
-            self.base, self.ready = pos, False
+            self.base, self.ready, self.settled = pos, False, False
             if self.interp and self.out:
                 self.chain = Chain(self.path, self.info, self.out, pos, self.plan, self.preset)
                 colour = colour_filter(self.info)
@@ -808,8 +913,11 @@ class Player:
                         (self.chain.p2.poll() is not None and self.chain.p2.returncode == 0)
                 if far:
                     self.mpv.cmd("quit")
-        elif ev == "property-change" and msg.get("name") == "paused-for-cache" and msg.get("data") is True:
-            self._underrun()
+        elif ev == "property-change" and msg.get("name") == "paused-for-cache":
+            if msg.get("data") is True:
+                self._underrun()
+            elif msg.get("data") is False and self.ready:
+                self.settled = True  # (the buffering at the stretch's start is over: it plays)
         elif ev == "property-change" and msg.get("name") in ("aid", "sid") and self.ready:
             # (picked with mpv's own keys: remembered like the menu's picks)
             v = msg.get("data")
@@ -825,7 +933,7 @@ class Player:
         """mpv ran out of frames: the frames aren't made fast enough. Twice within 20 s (not right after a
         seek): a quicker preset."""
         now = time.monotonic()
-        if not self.chain or now - getattr(self, "_started", 0) < 4:
+        if not self.chain or not self.settled or self.assessing or now - getattr(self, "_started", 0) < 4:
             return
         self.underruns = [t for t in self.underruns if now - t < 20] + [now]
         if len(self.underruns) >= 2 and self.plan["interp"] == "mvtools":
@@ -905,9 +1013,12 @@ class Player:
             missing = UPSCALE[self.upscale][2] and not files
             self.mpv.osd(f"Upscaling: {self.upscale}" + (" (its shader isn't installed: run install.sh)" if missing else ""), 3)
             self.menu()
-        elif what == "status":
-            self.mpv.osd(self.status(), 6)
-            self.mpv.cmd("script-message", "fvp-ui", "show", "6")
+        elif what == "stats":
+            self.stats_on = not self.stats_on
+            self._stats_draw()
+            self.menu()
+        elif what == "assess":
+            self.assess()
         elif what in ("aid", "sid"):
             v = int(args[1]) if args[1].isdigit() else "no"
             self.tracks[what] = v
@@ -1042,7 +1153,8 @@ class Player:
                    if p not in known]},
             sep,
             item("Full screen", "cycle fullscreen", "f", on=bool(self.mpv.get("fullscreen"))),
-            item("Status", sv("status"), "o"),
+            item("Statistics (processor, graphics, what does what)", sv("stats"), "o", on=self.stats_on),
+            item("Benchmark this computer (sets the best that keeps up)", sv("assess"), "b"),
             sep,
             item("Quit FVP", "quit", "q"),
         ]
@@ -1052,17 +1164,145 @@ class Player:
         return (f"{self.plan['interp']} '{self.preset}' on {self.plan['interp_on']}, "
                 f"{self.info['fn'] / self.info['fd']:.3f} -> {self.out[0] / self.out[1]:.3f} frames/s")
 
-    def status(self) -> str:
-        made = f", making {self.chain.fps:.0f}/s" if self.chain and self.chain.fps else ""
-        drops = self.mpv.get("frame-drop-count")
-        late = self.mpv.get("vo-delayed-frame-count")
-        return "\n".join([
-            f"{clock(self.pos())} / {clock(self.info['duration'])}   {self.info['w']}x{self.info['h']} "
-            f"{self.info['bits']}-bit",
-            "Frames in between: " + (self._interp_text() + made if self.interp and self.out else "off") + "   [i, p/P]",
-            f"Upscaling: {self.upscale} on {self.plan['upscale_on']}, {self.draw_ms():.1f} ms a frame   [u]",
-            f"Decoding: {self.plan['decode']}   dropped {drops}, late {late}",
-        ])
+    # --- statistics ---------------------------------------------------------------------------------------
+    def stats(self) -> list[str]:
+        """What's working on what, and how hard: the lines of the statistics on the picture."""
+        c, pl, info = self.probe["cpu"], self.plan, self.info
+        total, each = self.meters.cpu()
+        w, h = self.mpv.get("osd-width") or 0, self.mpv.get("osd-height") or 0
+        hz = self.mpv.get("display-fps") or 0
+        fps = info["fn"] / info["fd"]
+        shown = self.out[0] / self.out[1] if (self.chain and self.out) else fps
+        lines = [f"FVP {APP_VERSION}   {clock(self.pos())} / {clock(info['duration'])}",
+                 f"Film       {info['w']}x{info['h']} {info['bits']}-bit, {fps:.3f} frames/s",
+                 f"Screen     {w}x{h} at {hz:.2f} Hz" if w else "Screen     ?"]
+        if self.chain and self.out:
+            lines.append(f"Frames     {fps:.3f} -> {shown:.3f}/s by {pl['interp']} '{self.preset}' on {pl['interp_on']}")
+            lines.append(f"           making {self.chain.fps:.0f}/s (needs {shown:.0f})" if self.chain.fps else
+                         "           starting…")
+        else:
+            lines.append("Frames     in between: off (the film's own)")
+        ms, room = self.draw_ms(), 1000.0 / max(1.0, shown)
+        lines.append(f"Upscaling  {info['w']}x{info['h']} -> {w}x{h} by '{self.upscale}' on {pl['upscale_on']}")
+        lines.append(f"           {ms:.1f} ms a frame of {room:.1f} ms; dropped {self.mpv.get('frame-drop-count') or 0}, "
+                     f"late {self.mpv.get('vo-delayed-frame-count') or 0}")
+        lines.append(f"Decoding   {pl['decode'] + ' on ' + pl['decode_on'] if pl['decode'] != 'none' else 'on the processor'}")
+        lines.append("")
+        lines.append(f"Processor  {c['name']}")
+        lines.append(f"           {c.get('cores', '?')} cores / {c['threads']} threads, in use {total:.0f} %")
+        for i in range(0, len(each), 8):  # each thread's share, eight to a row
+            lines.append("           " + " ".join(f"{v:3.0f}" for v in each[i:i + 8]))
+        if self.chain:
+            parts = [("frames", self.chain.p2.pid), ("decoding", self.chain.p1.pid), ("mpv", self.mpv.proc.pid)]
+        else:
+            parts = [("mpv", self.mpv.proc.pid)]
+        lines.append("           " + ", ".join(f"{name} {self.meters.proc(pid) / 100:.1f} threads" for name, pid in parts))
+        for g in self.probe["gpus"]:
+            load = self.meters.gpu(g)
+            lines.append(f"Graphics   {g['name']}: {load or 'the driver tells no load'}")
+        return lines
+
+    def _stats_draw(self) -> None:
+        self.mpv.overlay(5, self.stats() if self.stats_on else None)
+
+    def _stats_loop(self) -> None:
+        while not self.done.wait(1.0):
+            if self.stats_on and not self.assessing:
+                self._stats_draw()
+
+    # --- the benchmark ------------------------------------------------------------------------------------
+    def assess(self, quit_after: bool = False) -> None:
+        """What this computer can do with this film on this screen, measured, and set: the best frames-in-
+        between preset that keeps up with the screen's rate, and the best upscaling step that draws a frame
+        at the screen's size in time. About half a minute; the film goes on where it was."""
+        if self.assessing:
+            return
+        self.assessing = True
+        report = []
+        try:
+            hz = self.mpv.get("display-fps") or 60
+            dw, dh = self.mpv.get("display-width") or 0, self.mpv.get("display-height") or 0
+            target = f"{dw}x{dh} at {hz:.0f} Hz" if dw else f"{hz:.0f} Hz"
+            head = [f"FVP benchmark: what this computer can do, for the screen's {target}", ""]
+
+            def say(*lines):
+                self.mpv.overlay(6, head + report + list(lines), size=17, top=False)
+            pos, was_full = self.pos(), bool(self.mpv.get("fullscreen"))
+            out = out_rate(self.info, hz)
+            # 1. the frames in between
+            if self.plan["interp"] != "off" and out:
+                with self.lock:
+                    if self.chain:
+                        self.chain.stop()
+                        self.chain = None
+                    self.mpv.cmd("stop")
+                need = out[0] / out[1]
+                say(f"1/2  Frames in between, {self.info['fn'] / self.info['fd']:.3f} -> {need:.3f} a second…")
+                results = bench(self.path, 3.5, pos, False, self.info, self.plan, out,
+                                lambda p: say(f"1/2  Frames in between: trying '{p}'…"))
+                best = pick_preset(results)
+                for p, x in results.items():
+                    report.append(f"  frames '{p}': {x * need:5.0f}/s = {x:.2f}x what's needed"
+                                  + ("   <- picked" if p == best else ""))
+                if best:
+                    self.preset, self.interp, self.out = best, True, out
+                    self.cfg.setdefault("presets", {})[size_class(self.info)] = best
+                else:
+                    self.interp = False
+                    self.cfg.setdefault("presets", {})[size_class(self.info)] = PRESET_ORDER[0]
+                    report.append("  none keeps up: frames in between off for films this size")
+            else:
+                report.append("  frames in between: " + ("not needed, the film has the screen's rate" if not out
+                                                         else "not available (VapourSynth is missing)"))
+            report.append("")
+            # 2. the upscaling, on the whole screen, with the frames coming as they will
+            self.mpv.set("fullscreen", True)
+            self.upscale = UPSCALE_ORDER[0]
+            self._upscale_set()
+            self._started = time.monotonic()
+            self.start(pos)
+            say("2/2  Upscaling: starting the film…")
+            for _ in range(60):
+                if self.settled or self.done.wait(0.25):
+                    break
+            fps = (self.out[0] / self.out[1]) if (self.chain and self.out) else self.info["fn"] / self.info["fd"]
+            room, picked = 600.0 / max(1.0, fps), UPSCALE_ORDER[0]
+            for step in UPSCALE_ORDER:
+                if UPSCALE[step][2] and not shader_list(step):
+                    continue  # (its shader isn't installed)
+                self.upscale = step
+                self._upscale_set()
+                say(f"2/2  Upscaling: trying '{step}'…")
+                if self.done.wait(3.5):
+                    return
+                ms = self.draw_ms()
+                ok = ms <= room
+                if ok:
+                    picked = step
+                report.append(f"  upscaling '{step}': {ms:5.1f} ms a frame (room for {room:.1f})"
+                              + ("" if ok else "   too slow"))
+                if not ok:
+                    break
+            report[:] = [ln + ("   <- picked" if ln.startswith(f"  upscaling '{picked}'") else "") for ln in report]
+            self.upscale = picked
+            self._upscale_set()
+            self.cfg["upscale"] = picked
+            save_config(self.cfg)
+            self.mpv.set("fullscreen", was_full)
+            w, h = self.mpv.get("osd-width") or dw, self.mpv.get("osd-height") or dh
+            report += ["", f"Set: frames in between {'%s (%s)' % (self.preset, self.plan['interp']) if self.interp and self.out else 'off'}, "
+                           f"upscaling '{picked}'. Remembered for films this size."]
+            say()
+            print("\n".join(head + report), flush=True)
+            self.menu()
+            if quit_after:
+                self.done.wait(2)
+                self.mpv.cmd("quit")
+            else:
+                self.done.wait(12)
+        finally:
+            self.assessing = False
+            self.mpv.overlay(6, None)
 
     def run(self) -> int:
         try:
@@ -1137,10 +1377,12 @@ def auto_update(argv: list[str]) -> None:
 USAGE = f"""usage: {APP} FILM [--start SECONDS] [--preset {'|'.join(PRESET_ORDER)}] [--upscale {'|'.join(UPSCALE_ORDER)}]
                     [--no-interp] [--no-update] [-- mpv options]
        {APP} probe            what this computer has and what will be used for what
-       {APP} bench FILM       how fast each preset runs here; the best one that keeps up is remembered
+       {APP} bench FILM       measures what this computer can do for its screen (size and rate) with this
+                              film, and sets the best frames-in-between preset and upscaling that keep up
 
 keys: arrows / PgUp / PgDn seek, + / - or the mouse wheel volume, i frames in between on/off,
-      p / P better / quicker preset, u upscaling step, o or Tab status, space pause, f full screen, q quit
+      p / P better / quicker preset, u upscaling step, o or Tab statistics, b benchmark, space pause,
+      f full screen, q quit
 mouse: right click the menu (sound and subtitle tracks, subtitles from the web, everything else);
        move it for the bar along the bottom (position / length), click or drag the bar to seek"""
 
@@ -1160,21 +1402,10 @@ def main(argv: list[str]) -> int:
         print(probe_text(probe()))
         return 0
     if argv[0] == "bench":
-        if len(argv) < 2:
+        if len(argv) < 2 or not os.path.exists(argv[1]):
             print(USAGE)
             return 2
-        info = film_info(argv[1])
-        print(f"{os.path.basename(argv[1])}: {info['w']}x{info['h']} {info['bits']}-bit, {info['fn'] / info['fd']:.3f} frames/s")
-        results = bench(argv[1])
-        best = pick_preset(results)
-        cfg = load_config()
-        if best:
-            cfg.setdefault("presets", {})[size_class(info)] = best
-            save_config(cfg)
-            print(f"-> '{best}' for {size_class(info)} films (remembered)")
-        else:
-            print("-> none keeps up with room to spare: frames in between would stutter at this size here")
-        return 0
+        return Player(argv[1], {"mpv": argv[3:] if len(argv) > 2 and argv[2] == "--" else [], "bench": True}).run()
     opts, files, i = {"mpv": []}, [], 0
     while i < len(argv):
         a = argv[i]

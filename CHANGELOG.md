@@ -3,6 +3,10 @@
 Numbering as in Handheld Control and Rádio Beat: 0.MINOR.PATCH. Every change (commit) is a version: PATCH one
 more; a bigger novelty raises MINOR (PATCH from 0 again).
 
+## 0.3 — Statistics and the benchmark
+
+- **0.3.0** (2026-11-15) After a seek (and at the film's start) the picture waits until a second of the film is ready and only then plays: the first frames come slower than they play, and it stuttered until they caught up. **Statistics** on the picture (`o`, Tab or the menu), refreshed every second: the film and the screen, what makes the frames in between (which preset, on which processor, how many a second against how many are needed), what upscales (which step, on which card, a frame's drawing time against the time there is), decoding, the processor (cores / threads, each thread's load, how many threads the frame maker, the decoder and mpv take) and each graphics card's load and memory. **Benchmark** (`b`, the menu, or `fvp bench FILM`): measures what this computer can do for its own screen (its size and rate, 4K at 60 Hz for example) and sets the best frames-in-between preset and the best upscaling step that keep up; about half a minute, the film goes on where it was. It runs by itself the first time a film of a new size is played on a computer
+
 ## 0.2 — Menu, seek bar, subtitles
 
 - **0.2.1** (2026-11-14) The right mouse button opens the menu (it did nothing: it was bound to mpv's command for a system-native menu, which Linux doesn't have; mpv's own menu script draws it now); what's on in the menu is marked with a dot. FVP updates itself at the start of playing: when GitHub has a newer release, it's downloaded, installed and started in place of the old one, in a few seconds (skipped without a network, with `--no-update`, or with `"auto_update": false` in ~/.config/fvp/config.json)
